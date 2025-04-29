@@ -32,7 +32,16 @@ if __name__ == "__main__":
         raise ValueError(f"`models_root` not exists: {models_root_path}")
 
     # Load models
-    hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args)
+    hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args,device="cpu")
+    pipe = hunyuan_video_sampler.pipeline
+    hunyuan_video_sampler.model.enable_teacache = True
+    hunyuan_video_sampler.model.rel_l1_thresh = 0.15
+    hunyuan_video_sampler.model.num_steps =args.infer_steps 
+    hunyuan_video_sampler.model.cnt = 0
+    
+    
+    from mmgp import offload
+    offload.profile(pipe,profile_no=2)
     
     # Get the updated args
     args = hunyuan_video_sampler.args
@@ -62,7 +71,7 @@ if __name__ == "__main__":
     print(f"Memory: {torch.cuda.memory_allocated() // 1024 ** 2} / {torch.cuda.max_memory_allocated() // 1024 ** 2} MB before Inference")
 
     cfg_size, num_head, head_dim, dtype, device = 1, 24, 128, torch.bfloat16, "cuda"
-    context_length, num_frame, frame_size = 256, 33, 3600
+    context_length, num_frame, frame_size = 256, args.video_length//4 + 1, 3600
 
     # Calculation
     spatial_width = temporal_width = sparsity_to_width(args.sparsity, context_length, num_frame, frame_size)
@@ -77,7 +86,7 @@ if __name__ == "__main__":
         def get_attention_mask(mask_name):
 
             context_length = 256
-            num_frame = 33
+            num_frame = args.video_length // 4 + 1
             frame_size = 3600
             attention_mask = torch.zeros((context_length + num_frame * frame_size, context_length + num_frame * frame_size), device="cpu")
 
@@ -121,6 +130,7 @@ if __name__ == "__main__":
 
         AttnModule = Hunyuan_SparseAttn
         AttnModule.num_sampled_rows = args.num_sampled_rows
+        AttnModule.num_frame = num_frame
         AttnModule.sample_mse_max_row = args.sample_mse_max_row
         AttnModule.attention_masks = [get_attention_mask(mask_name) for mask_name in masks]
         AttnModule.first_layers_fp = args.first_layers_fp

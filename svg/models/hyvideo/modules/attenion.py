@@ -19,6 +19,34 @@ except ImportError:
     flash_attn_varlen_func = None
     _flash_attn_forward = None
 
+def clear_list(l):
+    for i in range(len(l)):
+        l[i] = None
+
+try:
+    from sageattention import sageattn
+    @torch.compiler.disable()
+    def sageattn_wrapper(
+            qkv_list,
+            attention_length
+        ):
+        q,k, v = qkv_list
+        padding_length = q.shape[1] -attention_length
+        q = q[:, :attention_length, :, : ]
+        k = k[:, :attention_length, :, : ]
+        v = v[:, :attention_length, :, : ]
+
+        o = sageattn(q, k, v, tensor_layout="NHD")
+        del q, k ,v
+        clear_list(qkv_list)
+
+        if padding_length > 0:
+            o = torch.cat([o, torch.empty( (o.shape[0], padding_length, *o.shape[-2:]), dtype= o.dtype, device=o.device  ) ], 1)
+
+        return o
+
+except ImportError:
+    sageattn = None
 
 flex_attention = torch.compile(flex_attention, dynamic=False)
 torch._dynamo.config.cache_size_limit = 192 * 3
@@ -38,6 +66,10 @@ MEMORY_LAYOUT = {
         lambda x: x.transpose(1, 2),
         lambda x: x.transpose(1, 2),
     ),
+    "sage2": (
+        lambda x: x,
+        lambda x: x,
+    ),
     "vanilla": (
         lambda x: x.transpose(1, 2),
         lambda x: x.transpose(1, 2),
@@ -49,7 +81,7 @@ class Hunyuan_SparseAttn:
     attention_masks = None
 
     context_length = 256
-    num_frame = 33
+    num_frame = 33 
     frame_size = 3600
 
     first_layers_fp = 0
@@ -259,6 +291,10 @@ def attention(
             max_seqlen_q,
             max_seqlen_kv,
         )
+    elif mode == "sage2":
+        qkv_list = [q, k, v]
+        del q, k , v
+        x = sageattn_wrapper(qkv_list, cu_seqlens_q)
     elif mode == "flash":
         x = flash_attn_varlen_func(
             q,

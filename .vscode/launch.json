@@ -1,0 +1,19 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+
+        {
+            "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": "--video-size 720 1280      --video-length 49      --infer-steps 50      --seed 0    --prompt \"A cat walks on the grass, realistic style.\"     --embedded-cfg-scale 6.0      --flow-shift 7.0     --flow-reverse     --use-cpu-offload   --output_path ./output.mp4      --pattern \"SVG\"    --num_sampled_rows 64   --sparsity 0.2    --first_times_fp 0.055      --first_layers_fp 0.025",
+            "justMyCode": false
+        }
+    ]
+}

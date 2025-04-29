@@ -198,10 +198,10 @@ class Inference(object):
             factor_kwargs=factor_kwargs,
         )
         if args.use_fp8:
+            args.dit_weight = args.dit_weight.replace('.pt', '_fp8.pt')
             convert_fp8_linear(model, args.dit_weight, original_dtype=PRECISION_TO_TYPE[args.precision])
+
         model = model.to(device)
-        model = Inference.load_state_dict(args, model, pretrained_model_path)
-        model.eval()
 
         # ============================= Build extra models ========================
         # VAE
@@ -262,6 +262,11 @@ class Inference(object):
                 logger=logger,
                 device=device if not args.use_cpu_offload else "cpu",
             )
+
+        from mmgp import offload
+        # model = Inference.load_state_dict(args, model, pretrained_model_path)
+        offload.load_model_data(model,args.dit_weight)
+        model.eval()
 
         return cls(
             args=args,
