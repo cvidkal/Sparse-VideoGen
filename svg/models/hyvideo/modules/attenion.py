@@ -47,6 +47,7 @@ try:
 
 except ImportError:
     sageattn = None
+    print("SageAttention is not installed")
 
 flex_attention = torch.compile(flex_attention, dynamic=False)
 torch._dynamo.config.cache_size_limit = 192 * 3
@@ -268,7 +269,7 @@ def attention(
             full_attention_flag = True
 
         if full_attention_flag:    
-            mode = "flash"
+            mode = "sage2"
         else:
             mode = "sparse"
 

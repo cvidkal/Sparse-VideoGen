@@ -2,6 +2,7 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
+import math
 
 
 class ModulateDiT(nn.Module):
@@ -48,6 +49,40 @@ def modulate(x, shift=None, scale=None):
     else:
         return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+def modulate_(x, shift=None, scale=None):
+
+    if scale is None and shift is None:
+        return x
+    elif shift is None:
+        scale = scale + 1
+        scale = scale.unsqueeze(1)
+        return x.mul_(scale) 
+    elif scale is None:
+        return x + shift.unsqueeze(1)
+    else:
+        scale = scale + 1
+        scale = scale.unsqueeze(1)
+        # return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        torch.addcmul(shift.unsqueeze(1), x,  scale, out =x )
+        return x 
+    
+def modulate(x, shift=None, scale=None, condition_type=None,
+             tr_shift=None, tr_scale=None,
+             frist_frame_token_num=None):
+    if condition_type == "token_replace":
+        x_zero = x[:, :frist_frame_token_num] * (1 + tr_scale.unsqueeze(1)) + tr_shift.unsqueeze(1)
+        x_orig = x[:, frist_frame_token_num:] * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        x = torch.concat((x_zero, x_orig), dim=1)
+        return x
+    else:
+        if scale is None and shift is None:
+            return x
+        elif shift is None:
+            return x * (1 + scale.unsqueeze(1))
+        elif scale is None:
+            return x + shift.unsqueeze(1)
+        else:
+            return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 def apply_gate(x, gate=None, tanh=False):
     """AI is creating summary for apply_gate
@@ -67,6 +102,13 @@ def apply_gate(x, gate=None, tanh=False):
     else:
         return x * gate.unsqueeze(1)
 
+def apply_gate_and_accumulate_(accumulator, x, gate=None, tanh=False):
+    if gate is None:
+        return accumulator
+    if tanh:
+        return accumulator.addcmul_(x, gate.unsqueeze(1).tanh())   
+    else:
+        return accumulator.addcmul_(x, gate.unsqueeze(1))
 
 def ckpt_wrapper(module):
     def ckpt_forward(*inputs):

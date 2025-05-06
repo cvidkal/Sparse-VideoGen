@@ -58,6 +58,15 @@ class RMSNorm(nn.Module):
             output = output * self.weight
         return output
 
+    def apply_(self, x):
+        y = x.pow(2).mean(-1, keepdim=True)
+        y.add_(self.eps)
+        y.rsqrt_()
+        x.mul_(y)
+        del y
+        if hasattr(self, "weight"):
+            x.mul_(self.weight)
+        return x
 
 def get_norm_layer(norm_layer):
     """

@@ -15,7 +15,7 @@ from .embed_layers import TimestepEmbedder, PatchEmbed, TextProjection
 from .attenion import attention, parallel_attention, get_cu_seqlens
 from .posemb_layers import apply_rotary_emb
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
-from .modulate_layers import ModulateDiT, modulate, apply_gate
+from .modulate_layers import ModulateDiT, modulate, modulate_ , apply_gate, apply_gate_and_accumulate_
 from .token_refiner import SingleTokenRefiner
 import numpy as np
 
@@ -166,47 +166,61 @@ class MMDoubleStreamBlock(nn.Module):
             txt_mod2_gate,
         ) = self.txt_mod(vec).chunk(6, dim=-1)
 
+        ##### Enjoy this spagheti VRAM optimizations done by DeepBeepMeep !
+        # I am sure you are a nice person and as you copy this code, you will give me officially proper credits:
+        # Please link to https://github.com/deepbeepmeep/HunyuanVideoGP and @deepbeepmeep on twitter  
         # Prepare image for attention.
         img_modulated = self.img_norm1(img)
-        img_modulated = modulate(
-            img_modulated, shift=img_mod1_shift, scale=img_mod1_scale
-        )
-        img_qkv = self.img_attn_qkv(img_modulated)
-        img_q, img_k, img_v = rearrange(
-            img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
-        )
+        img_modulated = img_modulated.to(torch.bfloat16)
+        modulate_( img_modulated, shift=img_mod1_shift, scale=img_mod1_scale )
+
+
+        shape = (*img_modulated.shape[:2], self.heads_num, int(img_modulated.shape[-1] / self.heads_num) )
+        img_q = self.img_attn_q(img_modulated).view(*shape)
+        img_k = self.img_attn_k(img_modulated).view(*shape)        
+        img_v = self.img_attn_v(img_modulated).view(*shape)
+        del img_modulated
         # Apply QK-Norm if needed
-        img_q = self.img_attn_q_norm(img_q).to(img_v)
-        img_k = self.img_attn_k_norm(img_k).to(img_v)
+        self.img_attn_q_norm.apply_(img_q).to(img_v)
+        img_q_len = img_q.shape[1]
+        self.img_attn_k_norm.apply_(img_k).to(img_v)
+        img_kv_len= img_k.shape[1]        
+        batch_size = img_k.shape[0]
 
         # Apply RoPE if needed.
         if freqs_cis is not None:
-            img_qq, img_kk = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
-            assert (
-                img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
-            ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
-            img_q, img_k = img_qq, img_kk
+            img_q, img_k = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
+            # assert (
+            #     img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
+            # ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
+            # img_q, img_k = img_qq, img_kk
+            # del img_qq, img_kk
 
         # Prepare txt for attention.
         txt_modulated = self.txt_norm1(txt)
-        txt_modulated = modulate(
-            txt_modulated, shift=txt_mod1_shift, scale=txt_mod1_scale
-        )
+        modulate_(txt_modulated, shift=txt_mod1_shift, scale=txt_mod1_scale )
+
         txt_qkv = self.txt_attn_qkv(txt_modulated)
+        del txt_modulated
         txt_q, txt_k, txt_v = rearrange(
             txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
         )
+        del txt_qkv
         # Apply QK-Norm if needed.
-        txt_q = self.txt_attn_q_norm(txt_q).to(txt_v)
-        txt_k = self.txt_attn_k_norm(txt_k).to(txt_v)
+        self.txt_attn_q_norm.apply_(txt_q).to(txt_v)
+        self.txt_attn_k_norm.apply_(txt_k).to(txt_v)
 
         # Run actual attention.
         q = torch.cat((img_q, txt_q), dim=1)
+        img_q_len = img_q.shape[1]
+        del img_q, txt_q
         k = torch.cat((img_k, txt_k), dim=1)
+        img_kv_len = img_k.shape[1]
+        batch_size = img_k.shape[0]
+        del img_k, txt_k
+
         v = torch.cat((img_v, txt_v), dim=1)
-        assert (
-            cu_seqlens_q.shape[0] == 2 * img.shape[0] + 1
-        ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
+        del img_v, txt_v
 
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
@@ -219,7 +233,7 @@ class MMDoubleStreamBlock(nn.Module):
                 cu_seqlens_kv=cu_seqlens_kv,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
-                batch_size=img_k.shape[0],
+                batch_size=batch_size,
                 timestep=timestep,
                 layer_idx=self.layer_idx
             )
@@ -229,37 +243,37 @@ class MMDoubleStreamBlock(nn.Module):
                 q,
                 k,
                 v,
-                img_q_len=img_q.shape[1],
-                img_kv_len=img_k.shape[1],
+                img_q_len=img_q_len,
+                img_kv_len=img_kv_len,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_kv=cu_seqlens_kv
             )
-        
+        del q, k, v
         # attention computation end
 
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1] :]
-
+        del attn
         # Calculate the img bloks.
-        img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
-        img = img + apply_gate(
-            self.img_mlp(
-                modulate(
-                    self.img_norm2(img), shift=img_mod2_shift, scale=img_mod2_scale
-                )
-            ),
-            gate=img_mod2_gate,
-        )
+        img_attn = self.img_attn_proj(img_attn)
+        apply_gate_and_accumulate_(img, img_attn, gate=img_mod1_gate)
+        del img_attn
+        img_modulated = self.img_norm2(img)
+        img_modulated = img_modulated.to(torch.bfloat16)
+        modulate_( img_modulated , shift=img_mod2_shift, scale=img_mod2_scale)
+        self.img_mlp.apply_(img_modulated)        
+        apply_gate_and_accumulate_(img, img_modulated, gate=img_mod2_gate)
+        del img_modulated
 
         # Calculate the txt bloks.
-        txt = txt + apply_gate(self.txt_attn_proj(txt_attn), gate=txt_mod1_gate)
-        txt = txt + apply_gate(
-            self.txt_mlp(
-                modulate(
-                    self.txt_norm2(txt), shift=txt_mod2_shift, scale=txt_mod2_scale
-                )
-            ),
-            gate=txt_mod2_gate,
-        )
+        txt_attn  = self.txt_attn_proj(txt_attn)
+        apply_gate_and_accumulate_(txt, txt_attn, gate=txt_mod1_gate)
+        del txt_attn
+        txt_modulated = self.txt_norm2(txt)
+        txt_modulated = txt_modulated.to(torch.bfloat16)
+        modulate_(txt_modulated, shift=txt_mod2_shift, scale=txt_mod2_scale)
+        txt_mlp = self.txt_mlp(txt_modulated)
+        del txt_modulated 
+        apply_gate_and_accumulate_(txt, txt_mlp, gate=txt_mod2_gate)
 
         return img, txt
 
@@ -342,7 +356,9 @@ class MMSingleStreamBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        # x: torch.Tensor,
+        img: torch.Tensor,
+        txt: torch.Tensor,
         vec: torch.Tensor,
         txt_len: int,
         cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -352,44 +368,47 @@ class MMSingleStreamBlock(nn.Module):
         freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
         timestep: torch.Tensor = None,
     ) -> torch.Tensor:
+        ##### More spagheti VRAM optimizations done by DeepBeepMeep !
+        # I am sure you are a nice person and as you copy this code, you will give me proper credits:
+        # Please link to https://github.com/deepbeepmeep/HunyuanVideoGP and @deepbeepmeep on twitter  
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
-        x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
-        qkv, mlp = torch.split(
-            self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
-        )
 
-        q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
+        img_mod = self.pre_norm(img)
+        img_mod = img_mod.to(torch.bfloat16)
+        modulate_(img_mod, shift=mod_shift, scale=mod_scale)
+        txt_mod = self.pre_norm(txt)
+        txt_mod = txt_mod.to(torch.bfloat16)
+        modulate_(txt_mod, shift=mod_shift, scale=mod_scale)
 
-        # Cause Inefficiency
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
+        shape = (*img_mod.shape[:2], self.heads_num, int(img_mod.shape[-1] / self.heads_num) )
+        img_q = self.linear1_attn_q(img_mod).view(*shape)
+        img_k = self.linear1_attn_k(img_mod).view(*shape)
+        img_v = self.linear1_attn_v(img_mod).view(*shape)
+
+        shape = (*txt_mod.shape[:2], self.heads_num, int(txt_mod.shape[-1] / self.heads_num) )
+        txt_q = self.linear1_attn_q(txt_mod).view(*shape)
+        txt_k = self.linear1_attn_k(txt_mod).view(*shape)
+        txt_v = self.linear1_attn_v(txt_mod).view(*shape)
+
+        batch_size = img_mod.shape[0]        
+
         
         # Apply QK-Norm if needed.
-        q = self.q_norm(q).to(v)
-        k = self.k_norm(k).to(v)
+        self.q_norm.apply_(img_q)
+        self.k_norm.apply_(img_k)
+        self.q_norm.apply_(txt_q)
+        self.k_norm.apply_(txt_k)
 
-        # Apply RoPE if needed.
-        if freqs_cis is not None:
-            img_q, txt_q = q[:, :, :-txt_len, :], q[:, :, -txt_len:, :]
-            img_k, txt_k = k[:, :, :-txt_len, :], k[:, :, -txt_len:, :]
-
-            img_qq, img_kk = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=True)
-            assert (
-                img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
-            ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
-            img_q, img_k = img_qq, img_kk
-
-            q = torch.cat((img_q, txt_q), dim=2)
-            k = torch.cat((img_k, txt_k), dim=2)
-
-            # Cause Inefficiency
-            q = q.transpose(1, 2).contiguous()
-            k = k.transpose(1, 2).contiguous()
+        img_q, img_k = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
+        img_q_len=img_q.shape[1]
+        q = torch.cat((img_q, txt_q), dim=1)
+        del img_q, txt_q
+        k = torch.cat((img_k, txt_k), dim=1)
+        img_kv_len=img_k.shape[1]
+        del img_k, txt_k
         
-        # Compute attention.
-        assert (
-            cu_seqlens_q.shape[0] == 2 * x.shape[0] + 1
-        ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, x.shape[0]:{x.shape[0]}"
+        v = torch.cat((img_v, txt_v), dim=1)
+        del img_v, txt_v
 
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
@@ -402,7 +421,7 @@ class MMSingleStreamBlock(nn.Module):
                 cu_seqlens_kv=cu_seqlens_kv,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
-                batch_size=x.shape[0],
+                batch_size=batch_size,
                 timestep=timestep,
                 layer_idx=self.layer_idx
             )
@@ -412,16 +431,36 @@ class MMSingleStreamBlock(nn.Module):
                 q,
                 k,
                 v,
-                img_q_len=img_q.shape[1],
-                img_kv_len=img_k.shape[1],
+                img_q_len=img_q_len,
+                img_kv_len=img_kv_len,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_kv=cu_seqlens_kv
             )
         # attention computation end
+        del q, k, v
 
-        # Compute activation in mlp stream, cat again and run second linear layer.
-        output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
-        return x + apply_gate(output, gate=mod_gate)
+        x_mod =  torch.cat((img_mod, txt_mod), 1)
+        del img_mod, txt_mod
+        x_mod_shape = x_mod.shape
+        x_mod = x_mod.view(-1, x_mod.shape[-1])
+        chunk_size = int(x_mod_shape[1]/6)
+        x_chunks = torch.split(x_mod, chunk_size)
+        attn = attn.view(-1, attn.shape[-1])
+        attn_chunks =torch.split(attn, chunk_size)
+        for x_chunk, attn_chunk in zip(x_chunks, attn_chunks):
+            mlp_chunk = self.linear1_mlp(x_chunk)
+            mlp_chunk = self.mlp_act(mlp_chunk)
+            attn_mlp_chunk = torch.cat((attn_chunk, mlp_chunk), -1)
+            del attn_chunk, mlp_chunk 
+            x_chunk[...] = self.linear2(attn_mlp_chunk)
+            del attn_mlp_chunk
+        x_mod = x_mod.view(x_mod_shape)
+
+        apply_gate_and_accumulate_(img, x_mod[:, :-txt_len, :], gate=mod_gate)
+
+        apply_gate_and_accumulate_(txt, x_mod[:, -txt_len:, :], gate=mod_gate)
+
+        return img, txt
 
 
 class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
@@ -747,12 +786,14 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     double_block_args = None
 
                 # Merge txt and img to pass through single stream blocks.
-                x = torch.cat((img, txt), 1)
-                del img, txt
+                # x = torch.cat((img, txt), 1)
+                # del img, txt
                 if len(self.single_blocks) > 0:
                     for _, block in enumerate(self.single_blocks):
                         single_block_args = [
-                        x,
+                        # x,
+                        img,
+                        txt,
                         vec,
                         txt_seq_len,
                         cu_seqlens_q,
@@ -763,9 +804,9 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                         t
                         ]
 
-                        x = block(*single_block_args)
+                        img,txt = block(*single_block_args)
                         single_block_args = None
-                img = x[:, :img_seq_len, ...]
+                # img = x[:, :img_seq_len, ...]
                 self.previous_residual = img - ori_img
         else:
             # --------------------- Pass through DiT blocks ------------------------
@@ -785,11 +826,13 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 img, txt = block(*double_block_args)
 
             # Merge txt and img to pass through single stream blocks.
-            x = torch.cat((img, txt), 1)
+            # x = torch.cat((img, txt), 1)
             if len(self.single_blocks) > 0:
                 for _, block in enumerate(self.single_blocks):
                     single_block_args = [
-                        x,
+                        # x,
+                        img,
+                        txt,
                         vec,
                         txt_seq_len,
                         cu_seqlens_q,
@@ -800,9 +843,10 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                         t
                     ]
 
-                    x = block(*single_block_args)
+                    img,txt = block(*single_block_args)
 
-            img = x[:, :img_seq_len, ...]
+            # img = x[:, :img_seq_len, ...]
+            del txt
 
         # ---------------------------- Final layer ------------------------------
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)

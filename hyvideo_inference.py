@@ -10,6 +10,7 @@ import torch
 from svg.models.hyvideo.utils.file_utils import save_videos_grid
 from svg.models.hyvideo.config import parse_args
 from svg.models.hyvideo.inference import HunyuanVideoSampler
+import gc
 
 
 def sparsity_to_width(sparsity, context_length, num_frame, frame_size):
@@ -40,8 +41,31 @@ if __name__ == "__main__":
     hunyuan_video_sampler.model.cnt = 0
     
     
+
+def get_linear_split_map():
+    hidden_size = 3072
+    split_linear_modules_map =  {
+                                "img_attn_qkv" : {"mapped_modules" : ["img_attn_q", "img_attn_k", "img_attn_v"] , "split_sizes": [hidden_size, hidden_size, hidden_size]},
+                                "linear1" : {"mapped_modules" : ["linear1_attn_q", "linear1_attn_k", "linear1_attn_v", "linear1_mlp"] , "split_sizes":  [hidden_size, hidden_size, hidden_size, 7*hidden_size- 3*hidden_size]}
+                                }
+    return split_linear_modules_map
+try:
+    from xformers.ops.fmha.attn_bias import BlockDiagonalPaddedKeysMask
+except ImportError:
+    BlockDiagonalPaddedKeysMask = None
+
     from mmgp import offload
-    offload.profile(pipe,profile_no=2)
+    kwargs = { "extraModelsToQuantize": None}
+    profile = 2
+    preload = 0
+    if profile == 2 or profile == 4:
+        kwargs["budgets"] = { "transformer" : 100 if preload  == 0 else preload, "text_encoder" : 100, "*" : 1000 }
+    elif profile == 3:
+        kwargs["budgets"] = { "*" : "70%" }
+
+    split_linear_modules_map = get_linear_split_map()
+    offload.split_linear_modules(pipe.transformer, split_linear_modules_map )
+    offload.profile(pipe,profile_no=4,quantizeTransformer=False,**kwargs)
     
     # Get the updated args
     args = hunyuan_video_sampler.args
@@ -54,21 +78,22 @@ if __name__ == "__main__":
         block.sparse_args = args
     transformer.sparse_args = args
 
-    # We need to get the prompt len in advance, since HunyuanVideo handle the attention mask in a special way
-    prompt_mask = hunyuan_video_sampler.get_prompt_mask(
-        prompt=args.prompt, 
-        height=args.video_size[0],
-        width=args.video_size[1],
-        video_length=args.video_length,
-        negative_prompt=args.neg_prompt,
-        infer_steps=args.infer_steps,
-        guidance_scale=args.cfg_scale,
-        num_videos_per_prompt=args.num_videos,
-        embedded_guidance_scale=args.embedded_cfg_scale
-    )
-    prompt_len = prompt_mask.sum()
+    if args.pattern == "SVG":
+        # We need to get the prompt len in advance, since HunyuanVideo handle the attention mask in a special way
+        prompt_mask = hunyuan_video_sampler.get_prompt_mask(
+            prompt=args.prompt, 
+            height=args.video_size[0],
+            width=args.video_size[1],
+            video_length=args.video_length,
+            negative_prompt=args.neg_prompt,
+            infer_steps=args.infer_steps,
+            guidance_scale=args.cfg_scale,
+            num_videos_per_prompt=args.num_videos,
+            embedded_guidance_scale=args.embedded_cfg_scale
+        )
+        prompt_len = prompt_mask.sum()
 
-    print(f"Memory: {torch.cuda.memory_allocated() // 1024 ** 2} / {torch.cuda.max_memory_allocated() // 1024 ** 2} MB before Inference")
+        print(f"Memory: {torch.cuda.memory_allocated() // 1024 ** 2} / {torch.cuda.max_memory_allocated() // 1024 ** 2} MB before Inference")
 
     cfg_size, num_head, head_dim, dtype, device = 1, 24, 128, torch.bfloat16, "cuda"
     context_length, num_frame, frame_size = 256, args.video_length//4 + 1, 3600
@@ -106,7 +131,7 @@ if __name__ == "__main__":
                 # attention_mask = torch.load(f"/data/home/xihaocheng/andy_develop/tmp_data/hunyuanvideo/I2VSparse/sparseattn/v5/mask_tensor/mask_spatial.pt", map_location="cpu")
 
             else:
-                pixel_attn_mask = torch.zeros_like(attention_mask[:-context_length, :-context_length], dtype=torch.bool, device=device)
+                pixel_attn_mask = torch.zeros_like(attention_mask[:-context_length, :-context_length], dtype=torch.bool, device="cpu")
 
                 block_size, block_thres = 128, frame_size * 1.5
                 num_block = math.ceil(num_frame * frame_size / block_size)
@@ -147,6 +172,8 @@ if __name__ == "__main__":
 
     # Start sampling
     # TODO: batch inference check
+    torch.cuda.empty_cache()
+    gc.collect()
     outputs = hunyuan_video_sampler.predict(
         prompt=args.prompt, 
         height=args.video_size[0],

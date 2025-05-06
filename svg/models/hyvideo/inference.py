@@ -187,7 +187,7 @@ class Inference(object):
 
         # =========================== Build main model ===========================
         logger.info("Building model...")
-        factor_kwargs = {"device": device, "dtype": PRECISION_TO_TYPE[args.precision]}
+        factor_kwargs = {"device": "meta", "dtype": PRECISION_TO_TYPE[args.precision]}
         in_channels = args.latent_channels
         out_channels = args.latent_channels
 
@@ -200,8 +200,6 @@ class Inference(object):
         if args.use_fp8:
             args.dit_weight = args.dit_weight.replace('.pt', '_fp8.pt')
             convert_fp8_linear(model, args.dit_weight, original_dtype=PRECISION_TO_TYPE[args.precision])
-
-        model = model.to(device)
 
         # ============================= Build extra models ========================
         # VAE

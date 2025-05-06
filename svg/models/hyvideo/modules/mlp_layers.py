@@ -58,6 +58,19 @@ class MLP(nn.Module):
         x = self.drop2(x)
         return x
 
+    def apply_(self, x, divide = 4):
+        x_shape = x.shape
+        x = x.view(-1, x.shape[-1])
+        chunk_size = int(x_shape[1]/divide)
+        x_chunks = torch.split(x, chunk_size)
+        for i, x_chunk  in enumerate(x_chunks):
+            mlp_chunk = self.fc1(x_chunk)
+            mlp_chunk = self.act(mlp_chunk)
+            mlp_chunk = self.drop1(mlp_chunk)
+            mlp_chunk = self.norm(mlp_chunk)
+            mlp_chunk = self.fc2(mlp_chunk)
+            x_chunk[...] = self.drop2(mlp_chunk)
+        return x        
 
 # 
 class MLPEmbedder(nn.Module):
