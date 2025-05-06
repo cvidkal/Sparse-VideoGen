@@ -7,6 +7,7 @@ from loguru import logger
 from datetime import datetime
 
 import torch
+import torchvision
 from svg.models.hyvideo.utils.file_utils import save_videos_grid
 from svg.models.hyvideo.config import parse_args
 from svg.models.hyvideo.inference import HunyuanVideoSampler
@@ -24,6 +25,13 @@ def sparsity_to_width(sparsity, context_length, num_frame, frame_size):
     
     return width_frame
 
+def get_linear_split_map():
+    hidden_size = 3072
+    split_linear_modules_map =  {
+                                "img_attn_qkv" : {"mapped_modules" : ["img_attn_q", "img_attn_k", "img_attn_v"] , "split_sizes": [hidden_size, hidden_size, hidden_size]},
+                                "linear1" : {"mapped_modules" : ["linear1_attn_q", "linear1_attn_k", "linear1_attn_v", "linear1_mlp"] , "split_sizes":  [hidden_size, hidden_size, hidden_size, 7*hidden_size- 3*hidden_size]}
+                                }
+    return split_linear_modules_map
 
 if __name__ == "__main__":
     args = parse_args()
@@ -42,17 +50,6 @@ if __name__ == "__main__":
     
     
 
-def get_linear_split_map():
-    hidden_size = 3072
-    split_linear_modules_map =  {
-                                "img_attn_qkv" : {"mapped_modules" : ["img_attn_q", "img_attn_k", "img_attn_v"] , "split_sizes": [hidden_size, hidden_size, hidden_size]},
-                                "linear1" : {"mapped_modules" : ["linear1_attn_q", "linear1_attn_k", "linear1_attn_v", "linear1_mlp"] , "split_sizes":  [hidden_size, hidden_size, hidden_size, 7*hidden_size- 3*hidden_size]}
-                                }
-    return split_linear_modules_map
-try:
-    from xformers.ops.fmha.attn_bias import BlockDiagonalPaddedKeysMask
-except ImportError:
-    BlockDiagonalPaddedKeysMask = None
 
     from mmgp import offload
     kwargs = { "extraModelsToQuantize": None}
@@ -192,8 +189,13 @@ except ImportError:
     
     # Save samples
     if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
-        for i, sample in enumerate(samples):
-            sample = samples[i].unsqueeze(0)
-            save_videos_grid(sample, save_path, fps=24)
+        if len(samples) == 1:
+            sample = samples[0].unsqueeze(0)
+            torchvision.utils.save_image(sample, save_path)
             logger.info(f'Sample save to: {save_path}')
+        else:
+            for i, sample in enumerate(samples):
+                sample = samples[i].unsqueeze(0)
+                save_videos_grid(sample, save_path, fps=24)
+                logger.info(f'Sample save to: {save_path}')
 
