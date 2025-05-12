@@ -221,12 +221,36 @@ def add_denoise_schedule_args(parser: argparse.ArgumentParser):
 def add_inference_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group(title="Inference args")
 
+
+    group.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume the inference from the checkpoint.",
+    )
+
     # ======================== Model loads ========================
     group.add_argument(
         "--model-base",
         type=str,
         default="ckpts",
         help="Root path of all the models, including t2v models and extra models.",
+    )
+    group.add_argument(
+        "--loop-num",
+        type=int,
+        default=1,
+        help="The number of loops",
+    )
+    group.add_argument(
+        "--prompt-file",
+        type=str,
+        default="",
+        help="a txt file contains multiple prompts",
+    )
+    group.add_argument(
+        "--tea-cache",
+        action="store_true",
+        help="Use tea cache for inference",
     )
     group.add_argument(
         "--dit-weight",

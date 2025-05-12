@@ -269,7 +269,7 @@ def attention(
             full_attention_flag = True
 
         if full_attention_flag:    
-            mode = "sage2"
+            mode = "flash"
         else:
             mode = "sparse"
 

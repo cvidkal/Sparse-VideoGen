@@ -263,6 +263,7 @@ class Inference(object):
 
         from mmgp import offload
         # model = Inference.load_state_dict(args, model, pretrained_model_path)
+        print("load model...")
         offload.load_model_data(model,args.dit_weight)
         model.eval()
 

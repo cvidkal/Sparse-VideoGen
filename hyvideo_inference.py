@@ -1,3 +1,4 @@
+import glob
 import os
 import time
 import math
@@ -5,6 +6,7 @@ import json
 from pathlib import Path
 from loguru import logger
 from datetime import datetime
+import pandas as pd
 
 import torch
 import torchvision
@@ -12,6 +14,9 @@ from svg.models.hyvideo.utils.file_utils import save_videos_grid
 from svg.models.hyvideo.config import parse_args
 from svg.models.hyvideo.inference import HunyuanVideoSampler
 import gc
+
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 def sparsity_to_width(sparsity, context_length, num_frame, frame_size):
@@ -33,9 +38,100 @@ def get_linear_split_map():
                                 }
     return split_linear_modules_map
 
-if __name__ == "__main__":
-    args = parse_args()
-    print(args)
+
+
+class InferenceTask:
+    def __init__(self, args, rank, world_size):
+        self.args = args
+        self.rank = rank
+        self.world_size = world_size
+        # mkdir if not exists
+        os.makedirs(self.args.output_path, exist_ok=True)
+        os.makedirs(self.args.output_path + "/checkpoint", exist_ok=True)
+
+    def set_prompts(self, prompts):
+        self.prompts = prompts
+
+    def set_loop_num(self, loop_num):
+        self.loop_num = loop_num
+    
+    def generate_task_list(self):
+        self.task_list = {}
+        for i in range(self.loop_num):
+            for prompt in self.prompts:
+                if prompt not in self.task_list:
+                    self.task_list[prompt] = {}
+                self.task_list[prompt][i] = False
+    
+    def get_task(self,rank):
+        prompt = self.prompts[rank::self.world_size]
+        sub_task_list = {}
+        for p in prompt:
+            sub_task_list[p] = self.task_list[p]
+        return sub_task_list
+
+    def update_task(self, prompt, loop_idx, is_done):
+        self.task_list[prompt][loop_idx] = is_done
+
+    def save_task_list_checkpoint(self):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")    
+        save_path = self.args.output_path + f"/checkpoint/task_list_{timestamp}_{self.rank}.json"
+        with open(save_path, "w") as f:
+            json.dump(self.task_list, f)
+    
+    def load_task_list_checkpoint(self):
+        # find the latest checkpoint    
+        save_path = self.args.output_path + f"/checkpoint/task_list_*_{self.rank}.json"
+        files = glob.glob(save_path)
+        if len(files) == 0:
+            return
+        save_path = max(files, key=os.path.getctime)
+        with open(save_path, "r") as f:
+            self.task_list = json.load(f)
+        # count the number of tasks
+        task_num = 0
+        total_task_num = 0
+        for prompt in self.task_list:
+            for loop_idx in self.task_list[prompt]:
+                if self.task_list[prompt][loop_idx] == False:
+                    task_num += 1
+            total_task_num += len(self.task_list[prompt])
+        print(f"Total task num at rank {self.rank}: {total_task_num}, Task num: {task_num}")
+
+
+    def inference(self,inference_func):
+        task_list = self.get_task(self.rank)
+        for prompt, loop_idxs in task_list.items():
+            for loop_idx in loop_idxs:
+                if task_list[prompt][loop_idx] == False:   
+                    print(f"Inference {prompt} {loop_idx}")
+                    inference_func(self.args, prompt, loop_idx)
+                    self.update_task(prompt, loop_idx, True)
+                    self.save_task_list_checkpoint()
+    
+
+
+    
+def inference(args, rank, world_size):
+
+    prompts = []
+    if args.prompt_file != "":
+        with open(args.prompt_file, 'r') as f:
+            prompts = f.readlines()
+            # remove the last \n
+            prompts = [prompt.strip() for prompt in prompts]
+    else:
+        prompts = [args.prompt]
+
+
+    inference_task = InferenceTask(args, rank, world_size)
+    inference_task.set_prompts(prompts)
+    inference_task.set_loop_num(args.loop_num)
+    inference_task.generate_task_list()
+
+    if args.resume:
+        inference_task.load_task_list_checkpoint()
+    
     models_root_path = Path(args.model_base)
     if not models_root_path.exists():
         raise ValueError(f"`models_root` not exists: {models_root_path}")
@@ -43,14 +139,12 @@ if __name__ == "__main__":
     # Load models
     hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args,device="cpu")
     pipe = hunyuan_video_sampler.pipeline
-    hunyuan_video_sampler.model.enable_teacache = True
+    hunyuan_video_sampler.model.enable_teacache = args.tea_cache
     hunyuan_video_sampler.model.rel_l1_thresh = 0.15
     hunyuan_video_sampler.model.num_steps =args.infer_steps 
     hunyuan_video_sampler.model.cnt = 0
-    
-    
 
-
+    print("offload")
     from mmgp import offload
     kwargs = { "extraModelsToQuantize": None}
     profile = 2
@@ -62,7 +156,7 @@ if __name__ == "__main__":
 
     split_linear_modules_map = get_linear_split_map()
     offload.split_linear_modules(pipe.transformer, split_linear_modules_map )
-    offload.profile(pipe,profile_no=4,quantizeTransformer=False,**kwargs)
+    offload.profile(pipe,profile_no=4,quantizeTransformer=False,**kwargs,verboseLevel=0)
     
     # Get the updated args
     args = hunyuan_video_sampler.args
@@ -75,22 +169,23 @@ if __name__ == "__main__":
         block.sparse_args = args
     transformer.sparse_args = args
 
-    if args.pattern == "SVG":
-        # We need to get the prompt len in advance, since HunyuanVideo handle the attention mask in a special way
-        prompt_mask = hunyuan_video_sampler.get_prompt_mask(
-            prompt=args.prompt, 
-            height=args.video_size[0],
-            width=args.video_size[1],
-            video_length=args.video_length,
-            negative_prompt=args.neg_prompt,
-            infer_steps=args.infer_steps,
-            guidance_scale=args.cfg_scale,
-            num_videos_per_prompt=args.num_videos,
-            embedded_guidance_scale=args.embedded_cfg_scale
-        )
-        prompt_len = prompt_mask.sum()
+    # if args.pattern == "SVG":
+    #     # We need to get the prompt len in advance, since HunyuanVideo handle the attention mask in a special way
+    #     prompt_mask = hunyuan_video_sampler.get_prompt_mask(
+    #         prompt=args.prompt, 
+    #         height=args.video_size[0],
+    #         width=args.video_size[1],
+    #         video_length=args.video_length,
+    #         negative_prompt=args.neg_prompt,
+    #         infer_steps=args.infer_steps,
+    #         guidance_scale=args.cfg_scale,
+    #         num_videos_per_prompt=args.num_videos,
+    #         embedded_guidance_scale=args.embedded_cfg_scale
+    #     )
+    #     prompt_len = prompt_mask.sum()
 
-        print(f"Memory: {torch.cuda.memory_allocated() // 1024 ** 2} / {torch.cuda.max_memory_allocated() // 1024 ** 2} MB before Inference")
+    # print(f"Memory: {torch.cuda.memory_allocated() // 1024 ** 2} / {torch.cuda.max_memory_allocated() // 1024 ** 2} MB before Inference")
+    prompt_len = 255
 
     cfg_size, num_head, head_dim, dtype, device = 1, 24, 128, torch.bfloat16, "cuda"
     context_length, num_frame, frame_size = 256, args.video_length//4 + 1, 3600
@@ -103,6 +198,7 @@ if __name__ == "__main__":
     save_path = args.output_path
         
     if args.pattern == "SVG":
+        print("build sparse attention")
         masks = ["spatial", "temporal"]
 
         def get_attention_mask(mask_name):
@@ -167,35 +263,52 @@ if __name__ == "__main__":
         replace_sparse_forward()
 
 
-    # Start sampling
-    # TODO: batch inference check
     torch.cuda.empty_cache()
-    gc.collect()
-    outputs = hunyuan_video_sampler.predict(
-        prompt=args.prompt, 
-        height=args.video_size[0],
-        width=args.video_size[1],
-        video_length=args.video_length,
-        seed=args.seed,
-        negative_prompt=args.neg_prompt,
-        infer_steps=args.infer_steps,
-        guidance_scale=args.cfg_scale,
-        num_videos_per_prompt=args.num_videos,
-        flow_shift=args.flow_shift,
-        batch_size=args.batch_size,
-        embedded_guidance_scale=args.embedded_cfg_scale
-    )
-    samples = outputs['samples']
-    
-    # Save samples
-    if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
-        if len(samples) == 1:
-            sample = samples[0].unsqueeze(0)
-            torchvision.utils.save_image(sample, save_path)
+
+    def inference_func(args,prompt, loop_idx):
+        outputs = hunyuan_video_sampler.predict(
+            prompt=prompt, 
+            height=args.video_size[0],
+            width=args.video_size[1],
+            video_length=args.video_length,
+            seed=args.seed,
+            negative_prompt=args.neg_prompt,
+            infer_steps=args.infer_steps,
+            guidance_scale=args.cfg_scale,
+            num_videos_per_prompt=args.num_videos,
+            flow_shift=args.flow_shift,
+            batch_size=args.batch_size,
+            embedded_guidance_scale=args.embedded_cfg_scale
+        )
+        samples = outputs['samples']
+        save_path_i = f"{save_path}/{prompt[:180]}-{loop_idx}.mp4"
+        # Save samples
+        for i, sample in enumerate(samples):
+            sample = sample.unsqueeze(0)
+            save_videos_grid(sample, save_path_i, fps=24)
             logger.info(f'Sample save to: {save_path}')
-        else:
-            for i, sample in enumerate(samples):
-                sample = samples[i].unsqueeze(0)
-                save_videos_grid(sample, save_path, fps=24)
-                logger.info(f'Sample save to: {save_path}')
+
+    inference_task.inference(inference_func)
+
+
+
+if __name__ == "__main__":
+
+
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = 0 if 'LOCAL_RANK' not in os.environ else int(os.environ['LOCAL_RANK'])
+    torch.cuda.set_device(local_rank)
+    print(f"rank: {rank}, World size: {world_size} current_device: {torch.cuda.current_device()}")
+    
+
+    args = parse_args()
+    print(args)
+
+    inference(args, rank, world_size)
+
+    dist.destroy_process_group()
+    
+
 
