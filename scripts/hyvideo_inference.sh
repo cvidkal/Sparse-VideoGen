@@ -6,7 +6,8 @@
 # 35% → 0.07, 30% → 0.055, 25% → 0.04, 20% → 0.033, 15% → 0.02, 10% → 0.015
 first_times_fp=0.055
 first_layers_fp=0.025
-timestamp=$(date +%Y-%m-%d)
+# timestamp=$(date +%Y-%m-%d)
+timestamp=2025-05-12
 
 mode=$3
 loop_num=$4
@@ -21,8 +22,22 @@ fi
 set -o xtrace
 mkdir -p ./output/${timestamp}-${mode}
 
-if [ $mode="sparse" ]; then
-    torchrun --nnodes=$1 --nproc_per_node=$2 hyvideo_inference.py \
+whoami && echo $MASTER_ADDR && echo $MASTER_PORT && echo $RANK && echo $WORLD_SIZE
+
+if [ "$MASTER_ADDR" == "" ]; then
+    MASTER_ADDR_ARG=""
+else
+    MASTER_ADDR_ARG="--master_addr $MASTER_ADDR"
+fi
+
+if [ "$MASTER_PORT" == "" ]; then
+    MASTER_PORT_ARG=""
+else
+    MASTER_PORT_ARG="--master_port $MASTER_PORT"
+fi
+
+if [[ "$mode" == "sparse" ]]; then
+    torchrun --nnodes=$1 --nproc_per_node=$2 $MASTER_ADDR_ARG $MASTER_PORT_ARG --node_rank $RANK hyvideo_inference.py \
         --video-size 720 1280 \
         --video-length 49 \
         --infer-steps 50 \
@@ -34,14 +49,13 @@ if [ $mode="sparse" ]; then
         --output_path ./output/${timestamp}-${mode} \
         --pattern "SVG" \
         --num_sampled_rows 64 \
-        --sparsity 0.2 \
+        --sparsity 0.2 ${resume} \
         --tea-cache \
-        $resume \
         --first_times_fp $first_times_fp \
         --first_layers_fp $first_layers_fp \
         --loop-num $loop_num 
 else
-    torchrun --nnodes=$1 --nproc_per_node=$2 hyvideo_inference.py \
+    torchrun --nnodes=$1 --nproc_per_node=$2 $MASTER_ADDR_ARG $MASTER_PORT_ARG --node_rank $RANK hyvideo_inference.py \
         --video-size 720 1280 \
         --video-length 49 \
         --infer-steps 50 \
@@ -53,8 +67,7 @@ else
         --output_path ./output/${timestamp}-${mode}  \
         --pattern "dense" \
         --num_sampled_rows 64 \
-        --sparsity 0.2 \
-        $resume \ 
+        --sparsity 0.2 ${resume} \
         --first_times_fp $first_times_fp \
         --first_layers_fp $first_layers_fp \
         --loop-num $loop_num

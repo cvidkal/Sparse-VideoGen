@@ -16,6 +16,7 @@
 # Modified from diffusers==0.29.2
 #
 # ==============================================================================
+import os
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union, Tuple
 import torch
@@ -745,7 +746,11 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
+        # device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
+        # local_rank = int(os.environ["LOCAL_RANK"])
+        local_rank = os.environ["LOCAL_RANK"] if "LOCAL_RANK" in os.environ else 0
+        device = torch.device(f"cuda:{local_rank}")
+
 
         # 3. Encode input prompt
         lora_scale = (
@@ -994,7 +999,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
+        # device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
+        local_rank = os.environ["LOCAL_RANK"] if "LOCAL_RANK" in os.environ else 0
+        device = torch.device(f"cuda:{local_rank}")
 
         # 3. Encode input prompt
         lora_scale = (

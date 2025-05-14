@@ -294,6 +294,7 @@ class TextEncoder(nn.Module):
             return_texts (bool): Whether to return the decoded texts. Defaults to False.
         """
         device = self.model.device if device is None else device
+        print(f"text encoder device: {device}")
         use_attention_mask = use_default(use_attention_mask, self.use_attention_mask)
         hidden_state_skip_layer = use_default(
             hidden_state_skip_layer, self.hidden_state_skip_layer

@@ -6,3 +6,4 @@ output.mp4
 result/.vscode
 output/*
 logs/*
+prompts_dict.json

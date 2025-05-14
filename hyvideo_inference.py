@@ -51,6 +51,7 @@ class InferenceTask:
 
     def set_prompts(self, prompts):
         self.prompts = prompts
+        self.valid_prompts = prompts
 
     def set_loop_num(self, loop_num):
         self.loop_num = loop_num
@@ -64,7 +65,7 @@ class InferenceTask:
                 self.task_list[prompt][i] = False
     
     def get_task(self,rank):
-        prompt = self.prompts[rank::self.world_size]
+        prompt = self.valid_prompts[rank::self.world_size]
         sub_task_list = {}
         for p in prompt:
             sub_task_list[p] = self.task_list[p]
@@ -80,35 +81,50 @@ class InferenceTask:
             json.dump(self.task_list, f)
     
     def load_task_list_checkpoint(self):
-        # find the latest checkpoint    
-        save_path = self.args.output_path + f"/checkpoint/task_list_*_{self.rank}.json"
-        files = glob.glob(save_path)
-        if len(files) == 0:
-            return
-        save_path = max(files, key=os.path.getctime)
-        with open(save_path, "r") as f:
-            self.task_list = json.load(f)
-        # count the number of tasks
+        self.valid_prompts = []
+        max_world_size = 16
+        for rank in range(max_world_size):
+            # find the latest checkpoint    
+            save_path = self.args.output_path + f"/checkpoint/task_list_*_{rank}.json"
+            files = glob.glob(save_path)
+            if len(files) == 0:
+                continue
+            save_path = max(files, key=os.path.getctime)
+            print(f"rank {self.rank} load task list from {save_path}")
+            current_task_list = {}
+            with open(save_path, "r") as f:
+                current_task_list = json.load(f)
+            # count the number of tasks
+            for prompt in current_task_list:
+                for loop_idx in current_task_list[prompt]:
+                    if current_task_list[prompt][loop_idx] == True:
+                        loop_idx = int(loop_idx)
+                        self.task_list[prompt][loop_idx] = True
         task_num = 0
         total_task_num = 0
         for prompt in self.task_list:
             for loop_idx in self.task_list[prompt]:
                 if self.task_list[prompt][loop_idx] == False:
                     task_num += 1
+                    if prompt not in self.valid_prompts:
+                        self.valid_prompts.append(prompt)
             total_task_num += len(self.task_list[prompt])
+        
         print(f"Total task num at rank {self.rank}: {total_task_num}, Task num: {task_num}")
 
 
     def inference(self,inference_func):
         task_list = self.get_task(self.rank)
+        task_num = len(task_list)
         for prompt, loop_idxs in task_list.items():
             for loop_idx in loop_idxs:
                 if task_list[prompt][loop_idx] == False:   
-                    print(f"Inference {prompt} {loop_idx}")
+                    print(f"Inference: {prompt} {loop_idx}")
                     inference_func(self.args, prompt, loop_idx)
                     self.update_task(prompt, loop_idx, True)
                     self.save_task_list_checkpoint()
-    
+                    print(f"Inference done: {prompt} {loop_idx},{task_num} left at rank {self.rank}")
+            task_num -= 1
 
 
     
@@ -131,6 +147,9 @@ def inference(args, rank, world_size):
 
     if args.resume:
         inference_task.load_task_list_checkpoint()
+        print(f"rank {rank} barrier")
+        dist.barrier()
+        print(f"rank {rank} barrier done")
     
     models_root_path = Path(args.model_base)
     if not models_root_path.exists():
@@ -271,7 +290,6 @@ def inference(args, rank, world_size):
             height=args.video_size[0],
             width=args.video_size[1],
             video_length=args.video_length,
-            seed=args.seed,
             negative_prompt=args.neg_prompt,
             infer_steps=args.infer_steps,
             guidance_scale=args.cfg_scale,
@@ -294,13 +312,14 @@ def inference(args, rank, world_size):
 
 if __name__ == "__main__":
 
-
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl",init_method="env://")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = 0 if 'LOCAL_RANK' not in os.environ else int(os.environ['LOCAL_RANK'])
-    torch.cuda.set_device(local_rank)
-    print(f"rank: {rank}, World size: {world_size} current_device: {torch.cuda.current_device()}")
+    os.environ["CUDA_VISIBLE_DEVICES"] = f"{local_rank}"
+    print(f"cuda_visible_devices: {os.environ['CUDA_VISIBLE_DEVICES']}")
+    torch.cuda.set_device(f"cuda:{local_rank}")
+    print(f"rank: {rank},local_rank: {local_rank}, World size: {world_size} current_device: {torch.cuda.current_device()}")
     
 
     args = parse_args()
